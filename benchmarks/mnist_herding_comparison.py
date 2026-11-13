@@ -1,8 +1,35 @@
-"""Evaluate K-means, raw Herding, or L2 Herding Hopfield memories in MNIST."""
+"""Evaluate ONE memory variant of the MNIST Hopfield experiment.
+
+Pick the variant with ``--selection``:
+
+    baseline  frozen CNN only (no memory)
+    kmeans    CNN + Hopfield memory selected by K-means
+    raw       CNN + Hopfield memory selected by Herding in raw-embedding space
+    l2        CNN + Hopfield memory selected by Herding in L2-normalized space
+
+Each run is fully independent. It builds and evaluates only its own model and
+saves the same artifact set, covering the five criteria:
+
+    1. classification accuracy   (head_acc, clean and at every noise level)
+    2. robustness                (AUC of head_acc / proto_acc per noise type)
+    3. retrieval performance     (proto_acc + every scalar summarize_outputs metric)
+    4. memory selection time     (None for the baseline)
+    5. computational cost        (E7, E8, eval time, params, size, MACs, bridge)
+
+Nothing is compared inside this script. After running all four variants,
+compare the saved artifacts with ``benchmarks.compare_methods``:
+
+    python -m benchmarks.mnist_herding_comparison --selection baseline
+    python -m benchmarks.mnist_herding_comparison --selection kmeans
+    python -m benchmarks.mnist_herding_comparison --selection raw
+    python -m benchmarks.mnist_herding_comparison --selection l2
+    python -m benchmarks.compare_methods --reports-dir reports/mnist_herding_comparison
+"""
 
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -10,16 +37,31 @@ from typing import Any
 
 import numpy as np
 import torch
-
 from benchmarks import mnist_prototype_retrieval as benchmark
 from benchmarks.mnist_herding import timed_herding_memory_build
 
-NUM_MNIST_CLASSES = 10
-SELECTION_MODES = ("raw", "l2", "kmeans")
+DEFAULT_CONFIG_PATH = (
+    Path(__file__).resolve().parents[1] / "configs" / "mnist_herding_comparision.yaml"
+)
 
-# Memory construction timing protocol.
+NUM_MNIST_CLASSES = 10
+SELECTION_MODES = ("baseline", "raw", "l2", "kmeans", "all")
+SCHEMA_VERSION = 2
+
+# Folder / file names read by compare_memory_methods.py.
+# The folder prefix differs from the old script ("herding_comparison_<mode>"),
+# so old reports are never overwritten or mixed up with these.
+OUTPUT_PREFIX = "memory_run_"
+JSON_NAME = "herding_comparison.json"
+NPZ_NAME = "herding_predictions.npz"
+CSV_NAME = "herding_comparison.csv"
+MD_NAME = "herding_comparison.md"
+
+# Memory construction timing protocol (applies to the one method being run).
 MEMORY_TIMING_WARMUPS = 1
 MEMORY_TIMING_REPEATS = 3
+
+ACCURACY_METRICS = ("head_acc", "proto_acc")
 
 
 # ---------------------------------------------------------------------
@@ -37,8 +79,8 @@ def _normalize_selection_flag(selection: str) -> bool:
     """
     Convert the selection name into the Herding normalization flag.
 
-    K-means does not use this flag, so it maps to False. In a K-means
-    run the Herding timing therefore uses raw-embedding Herding.
+    Only the L2 variant normalizes. The baseline and K-means do not use
+    Herding, so they map to False.
     """
     if selection not in SELECTION_MODES:
         raise ValueError(
@@ -49,25 +91,61 @@ def _normalize_selection_flag(selection: str) -> bool:
     return selection == "l2"
 
 
-def _describe_selection(selection: str) -> tuple[str, str, str]:
-    """Return (method name, selection space, Herding-timing label)."""
+def _describe_selection(selection: str) -> tuple[str, str]:
+    """Return (method name, selection space)."""
+    if selection == "baseline":
+        return "CNN baseline", "none (no memory)"
     if selection == "kmeans":
-        method = "K-means"
-        space = "original raw CNN embeddings"
-    elif selection == "l2":
-        method = "L2 Herding"
-        space = "L2-normalized embeddings"
-    else:
-        method = "Raw Herding"
-        space = "original raw embeddings"
-
-    herding_label = "L2 Herding" if selection == "l2" else "Raw Herding"
-    return method, space, herding_label
+        return "K-means", "original raw CNN embeddings"
+    if selection == "l2":
+        return "L2 Herding", "L2-normalized embeddings"
+    return "Raw Herding", "original raw embeddings"
 
 
 def _tensor_to_numpy(tensor: torch.Tensor) -> np.ndarray:
     """Convert a tensor into a detached CPU NumPy array."""
     return tensor.detach().cpu().numpy()
+
+
+def _scalar_metrics(metrics: dict[str, Any]) -> dict[str, float]:
+    """Keep every scalar metric that summarize_outputs() returned."""
+    out: dict[str, float] = {}
+    for key, value in metrics.items():
+        if value is None:
+            continue
+        try:
+            out[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _fingerprint_net(net: torch.nn.Module) -> str:
+    """Hash of the CNN weights, so the comparison can prove a shared CNN."""
+    digest = hashlib.sha256()
+    for key, value in sorted(net.state_dict().items()):
+        digest.update(key.encode())
+        digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()[:16]
+
+
+def _fingerprint_labels(labels: torch.Tensor) -> str:
+    array = _tensor_to_numpy(labels).astype(np.int64, copy=False)
+    return hashlib.sha256(array.tobytes()).hexdigest()[:16]
+
+
+def _ms(stat: dict[str, Any]) -> str:
+    """Format a cost entry as mean ± std over seeds."""
+    return f"{stat['mean']:.4f} ± {stat['std']:.4f}"
+
+
+def level_key(level: float) -> str:
+    """Key fragment for a noise level (compare script uses the same rule)."""
+    return format(float(level), ".8g").replace(".", "p")
+
+
+def prediction_key(kind: str, seed: int, level: float, name: str) -> str:
+    return f"{kind}__seed_{seed}__level_{level_key(level)}__{name}"
 
 
 # ---------------------------------------------------------------------
@@ -81,7 +159,7 @@ def _evaluate_model(
     labels: torch.Tensor,
     run: benchmark.BaselineRun,
 ) -> dict[str, Any]:
-    """Evaluate one model and retain predictions and correctness."""
+    """Evaluate one model and retain metrics, predictions and correctness."""
     outputs = benchmark.forward_embeddings(
         net,
         embeddings,
@@ -125,10 +203,9 @@ def _evaluate_model(
     )
 
     return {
-        "metrics": {
-            "head_acc": float(metrics["head_acc"]),
-            "proto_acc": float(metrics["proto_acc"]),
-        },
+        # head_acc and proto_acc plus every other scalar diagnostic
+        # (entropy, top-1 weight, ...) for the retrieval-performance criterion.
+        "metrics": _scalar_metrics(metrics),
         "predictions": {
             "head": _tensor_to_numpy(head_predictions).astype(
                 np.int64, copy=False
@@ -148,26 +225,66 @@ def _evaluate_model(
     }
 
 
-def evaluate_pair(
+def evaluate_conditions(
     run: benchmark.BaselineRun,
-    hop_net: benchmark.MnistNet,
-    embeddings: torch.Tensor,
-) -> dict[str, Any]:
-    """Evaluate baseline and Hopfield on exactly the same embeddings."""
+    model: torch.nn.Module,
+    noise_levels: dict[str, list[float]],
+    seed: int,
+) -> dict[str, dict[float, dict[str, Any]]]:
+    """Evaluate ONE model on clean and every corrupted test condition."""
     labels = run.splits.test_labels
+    clean_embeddings = run.test_embeddings("gaussian", 0.0)
 
-    return {
-        "baseline": _evaluate_model(
-            run.net, embeddings, labels, run
-        ),
-        "hopfield": _evaluate_model(
-            hop_net, embeddings, labels, run
-        ),
+    for noise_kind in benchmark.NOISE_TYPES:
+        zero_noise_embeddings = run.test_embeddings(noise_kind, 0.0)
+
+        if not torch.equal(zero_noise_embeddings, clean_embeddings):
+            max_difference = (
+                zero_noise_embeddings - clean_embeddings
+            ).abs().max().item()
+
+            raise RuntimeError(
+                f"{noise_kind} at noise level 0.0 does not "
+                f"match clean embeddings for seed {seed}. "
+                f"Maximum absolute difference: {max_difference}."
+            )
+
+    clean_result = _evaluate_model(
+        model, clean_embeddings, labels, run
+    )
+
+    results: dict[str, dict[float, dict[str, Any]]] = {
+        "clean": {0.0: clean_result}
     }
+
+    for noise_kind in benchmark.NOISE_TYPES:
+        configured_levels = [
+            float(level) for level in noise_levels[noise_kind]
+        ]
+
+        if not configured_levels or configured_levels[0] != 0.0:
+            raise ValueError(
+                f"{noise_kind} noise grid must start at 0.0."
+            )
+
+        per_level = {0.0: clean_result}
+
+        for level in configured_levels:
+            if level == 0.0:
+                continue
+
+            test_embeddings = run.test_embeddings(noise_kind, level)
+            per_level[level] = _evaluate_model(
+                model, test_embeddings, labels, run
+            )
+
+        results[noise_kind] = per_level
+
+    return results
 
 
 # ---------------------------------------------------------------------
-# Memory construction timing
+# Memory construction timing (only the selected method is built/timed)
 # ---------------------------------------------------------------------
 
 
@@ -207,398 +324,110 @@ def timed_kmeans_memory_build(
     return memory, memory_labels, center_offset, elapsed
 
 
-def measure_memory_builds(
+def measure_memory_build(
     run: benchmark.BaselineRun,
     *,
     per_class: int,
     center: bool,
     num_classes: int,
-    normalize_for_selection: bool,
     selection: str,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
     torch.Tensor | None,
     float,
-    float,
-    list[float],
     list[float],
 ]:
     """
-    Measure K-means and Herding memory construction fairly, and return
-    the memory belonging to the requested selection mode.
+    Build and time the memory of the requested selection mode only.
 
-    Each method receives one unrecorded warmup and several measured
-    runs. The order alternates between measured repetitions.
+    The method receives unrecorded warmups and several measured
+    repetitions. Both builders are deterministic for a given seed, so the
+    memory from the last repetition is the memory used by the model.
 
     Returns:
-        memory, memory_labels, center_offset  (of the requested mode),
-        median Herding time, median K-means time,
-        all Herding timing samples, all K-means timing samples.
+        memory, memory_labels, center_offset,
+        median build time, all timing samples.
     """
-    if selection not in SELECTION_MODES:
-        raise ValueError(f"Unknown selection mode {selection!r}.")
+    if selection == "kmeans":
 
-    def run_kmeans():
-        return timed_kmeans_memory_build(
-            run,
-            per_class=per_class,
-            center=center,
-            num_classes=num_classes,
-        )
+        def build():
+            return timed_kmeans_memory_build(
+                run,
+                per_class=per_class,
+                center=center,
+                num_classes=num_classes,
+            )
 
-    def run_herding():
-        return timed_herding_memory_build(
-            run,
-            per_class=per_class,
-            center=center,
-            num_classes=num_classes,
-            normalize_for_selection=normalize_for_selection,
-        )
+    elif selection in ("raw", "l2"):
 
-    # Warmup: alternate which method runs first by seed.
-    if run.seed % 2 == 0:
-        warmup_results = (run_kmeans(), run_herding())
+        def build():
+            return timed_herding_memory_build(
+                run,
+                per_class=per_class,
+                center=center,
+                num_classes=num_classes,
+                normalize_for_selection=_normalize_selection_flag(
+                    selection
+                ),
+            )
+
     else:
-        warmup_results = (run_herding(), run_kmeans())
-
-    del warmup_results
-
-    kmeans_times: list[float] = []
-    herding_times: list[float] = []
-    last_results: dict[str, tuple] = {}
-
-    for repeat in range(MEMORY_TIMING_REPEATS):
-        order = (
-            (("kmeans", run_kmeans), ("herding", run_herding))
-            if repeat % 2 == 0
-            else (("herding", run_herding), ("kmeans", run_kmeans))
+        raise ValueError(
+            f"Selection mode {selection!r} does not build a memory."
         )
 
-        for name, build in order:
-            result = build()
-            last_results[name] = result
+    for _ in range(MEMORY_TIMING_WARMUPS):
+        build()
 
-            if name == "kmeans":
-                kmeans_times.append(float(result[3]))
-            else:
-                herding_times.append(float(result[3]))
+    samples: list[float] = []
+    result = None
 
-    # Both builds are deterministic, so the last repetition's memory
-    # is the memory for the requested method.
-    chosen = last_results["kmeans" if selection == "kmeans" else "herding"]
-    memory, memory_labels, center_offset, _ = chosen
+    for _ in range(MEMORY_TIMING_REPEATS):
+        result = build()
+        samples.append(float(result[3]))
+
+    memory, memory_labels, center_offset, _ = result
 
     return (
         memory,
         memory_labels,
         center_offset,
-        float(np.median(herding_times)),
-        float(np.median(kmeans_times)),
-        herding_times,
-        kmeans_times,
+        float(np.median(samples)),
+        samples,
     )
 
 
 # ---------------------------------------------------------------------
-# Statistical evaluation
+# Aggregation over seeds (one model)
 # ---------------------------------------------------------------------
 
 
-def calculate_paired_statistics(
-    per_seed_results: dict[int, dict[str, Any]],
-    *,
-    metric: str,
-) -> dict[str, Any]:
-    """Calculate paired statistics using the shared benchmark rules."""
-    if metric not in ("head", "proto"):
-        raise ValueError(f"Unknown statistical metric: {metric!r}")
-
-    seed_deltas: list[float] = []
-    mcnemar_results: list[dict[str, Any]] = []
-    seed_signs: list[int] = []
-
-    baseline_accuracies: list[float] = []
-    hopfield_accuracies: list[float] = []
-
-    for seed in sorted(per_seed_results):
-        result = per_seed_results[seed]
-
-        baseline = result["baseline"]
-        hopfield = result["hopfield"]
-
-        baseline_accuracy = float(
-            baseline["metrics"][f"{metric}_acc"]
-        )
-        hopfield_accuracy = float(
-            hopfield["metrics"][f"{metric}_acc"]
-        )
-
-        baseline_accuracies.append(baseline_accuracy)
-        hopfield_accuracies.append(hopfield_accuracy)
-
-        seed_deltas.append(
-            hopfield_accuracy - baseline_accuracy
-        )
-
-        baseline_correct = torch.as_tensor(
-            baseline["correct"][metric],
-            dtype=torch.bool,
-        )
-        hopfield_correct = torch.as_tensor(
-            hopfield["correct"][metric],
-            dtype=torch.bool,
-        )
-
-        test = benchmark.mcnemar_test(
-            baseline_correct,
-            hopfield_correct,
-        )
-        mcnemar_results.append(test)
-
-        seed_signs.append(
-            (test["c"] > test["b"])
-            - (test["c"] < test["b"])
-        )
-
-    if not seed_deltas:
-        raise ValueError(
-            "Cannot calculate statistics without seed results."
-        )
-
-    baseline_summary = benchmark.mean_std(baseline_accuracies)
-    hopfield_summary = benchmark.mean_std(hopfield_accuracies)
-
-    delta = hopfield_summary[0] - baseline_summary[0]
-
-    seed_statistics = benchmark.seed_stats(seed_deltas)
-
-    mcnemar_p_max = max(
-        result["p"] for result in mcnemar_results
-    )
-
-    winner = benchmark.decide_winner(
-        delta,
-        mcnemar_p_max,
-        seed_signs,
-        seed_statistics["wilcoxon_p"],
-    )
-
+def _stat(values: list[float]) -> dict[str, Any]:
+    mean, std = benchmark.mean_std(values)
     return {
-        "baseline": baseline_summary,
-        "hopfield": hopfield_summary,
-        "delta": delta,
-        "mcnemar_per_seed": mcnemar_results,
-        "mcnemar_p_max": mcnemar_p_max,
-        "seed_deltas": seed_statistics["seed_deltas"],
-        "n_pos": seed_statistics["n_pos"],
-        "n_neg": seed_statistics["n_neg"],
-        "wilcoxon_p": seed_statistics["wilcoxon_p"],
-        "seed_signs": seed_signs,
-        "winner": winner,
+        "mean": float(mean),
+        "std": float(std),
+        "per_seed": [float(v) for v in values],
     }
-
-
-# ---------------------------------------------------------------------
-# Computational cost measurements
-# ---------------------------------------------------------------------
-
-
-def measure_herding_costs(
-    cfg: dict[str, Any],
-    run: benchmark.BaselineRun,
-    hop: benchmark.MnistNet,
-    beta_star: float,
-    device: torch.device,
-    *,
-    train_times: list[float],
-    prototype_times: list[float],
-    selected_times: list[float],
-    herding_memory_times: list[float],
-    hopfield_build_times: list[float],
-    kmeans_memory_times: list[float],
-    representative_seed: int,
-) -> dict[str, Any]:
-    """Measure full-model and isolated Hopfield bridge costs."""
-    c = cfg["cost"]
-
-    assert isinstance(hop.bridge, benchmark.HopfieldBridge)
-
-    hop.bridge.set_retrieval(
-        beta=beta_star,
-        num_updates=1,
-    )
-
-    models: dict[str, torch.nn.Module] = {
-        "baseline": run.net,
-        "hopfield": hop,
-    }
-
-    timing = {
-        "repeats": c["repeats"],
-        "warmup": c["warmup"],
-        "iters": c["iters"],
-    }
-
-    print(
-        f"  Cost E7: batch size {c['batch_size']}, "
-        f"{c['repeats']} interleaved repeats."
-    )
-
-    e7 = benchmark.interleaved_cost(
-        models,
-        c["batch_size"],
-        device,
-        **timing,
-    )
-
-    print("  Cost: full test-set evaluation time.")
-
-    eval_times: dict[str, list[float]] = {
-        name: [] for name in models
-    }
-
-    model_names = list(models)
-
-    for repeat in range(c["repeats"]):
-        ordered_names = (
-            model_names
-            if repeat % 2 == 0
-            else model_names[::-1]
-        )
-
-        for name in ordered_names:
-            elapsed = benchmark.time_full_evaluation(
-                models[name],
-                run.splits.test_images,
-                batch_size=c["batch_size"],
-                device=device,
-            )
-            eval_times[name].append(elapsed)
-
-    print(f"  Cost E8: batch-size sweep {c['batch_sizes']}.")
-
-    e8 = {
-        bs: benchmark.interleaved_cost(
-            models,
-            bs,
-            device,
-            **timing,
-        )
-        for bs in c["batch_sizes"]
-    }
-
-    print("  Cost: complete-model storage and MAC measurements.")
-
-    static: dict[str, dict[str, Any]] = {}
-
-    for name, model in models.items():
-        assert isinstance(model, benchmark.MnistNet)
-
-        breakdown = benchmark.analytical_macs(model)
-
-        static[name] = {
-            "trainable_params": benchmark.count_trainable_params(
-                model
-            ),
-            "buffer_values": benchmark.count_buffer_values(model),
-            "floating_buffer_values": benchmark.count_buffer_values(
-                model,
-                floating_only=True,
-            ),
-            "model_size_bytes": benchmark.model_size_bytes(model),
-            "macs_breakdown": breakdown,
-            "macs_per_image": sum(
-                value for _, value in breakdown
-            ),
-            "hook_macs_per_image": benchmark.hook_macs(model),
-        }
-
-    bridge = hop.bridge
-    prototypes = bridge.prototypes
-
-    hopfield_bridge = {
-        "prototype_shape": list(prototypes.shape),
-        "prototype_dtype": str(prototypes.dtype),
-        "prototype_storage_bytes": (
-            prototypes.numel() * prototypes.element_size()
-        ),
-        "model_size_bytes": benchmark.model_size_bytes(bridge),
-        "buffer_values": benchmark.count_buffer_values(bridge),
-        "floating_buffer_values": benchmark.count_buffer_values(
-            bridge,
-            floating_only=True,
-        ),
-        "trainable_params": benchmark.count_trainable_params(bridge),
-        "macs_per_image": bridge.macs_per_image(),
-        "beta": bridge.beta,
-        "num_updates": bridge.num_updates,
-        "centered": bridge.center is not None,
-    }
-
-    return {
-        "representative_seed": representative_seed,
-        "num_threads": torch.get_num_threads(),
-        "device": str(device),
-        "e7": e7,
-        "eval_time_s": {
-            name: benchmark.median_iqr(values)
-            for name, values in eval_times.items()
-        },
-        "e8": {
-            str(bs): result
-            for bs, result in e8.items()
-        },
-        "static": static,
-        "hopfield_bridge": hopfield_bridge,
-        "train_time_s": benchmark.mean_std(train_times),
-        "prototype_time_s": benchmark.mean_std(prototype_times),
-        "selected_memory_time_s": benchmark.mean_std(selected_times),
-        "herding_memory_time_s": benchmark.mean_std(
-            herding_memory_times
-        ),
-        "kmeans_memory_time_s": benchmark.mean_std(kmeans_memory_times),
-        "hopfield_build_time_s": benchmark.mean_std(
-            hopfield_build_times
-        ),
-        "memory_timing_protocol": {
-            "warmups_per_method_per_seed": MEMORY_TIMING_WARMUPS,
-            "measured_repeats_per_method_per_seed": (
-                MEMORY_TIMING_REPEATS
-            ),
-            "per_seed_summary": "median",
-            "measurement_order": "alternating",
-        },
-    }
-
-
-# ---------------------------------------------------------------------
-# Result aggregation
-# ---------------------------------------------------------------------
 
 
 def aggregate_results(
     raw_results: dict[str, Any],
     noise_levels: dict[str, list[float]],
     seeds: list[int],
-    metric_names: tuple[str, ...],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Aggregate metrics and calculate paired statistical results."""
-    summaries: dict[str, Any] = {}
-    statistics: dict[str, Any] = {}
+) -> dict[str, list[dict[str, Any]]]:
+    """summaries[kind] = [{level, metrics: {name: {mean, std, per_seed}}}]."""
+    summaries: dict[str, list[dict[str, Any]]] = {}
 
     for kind, seed_results in raw_results.items():
         levels = (
             [0.0]
             if kind == "clean"
             else sorted({
-                float(level)
-                for level in noise_levels[kind]
+                float(level) for level in noise_levels[kind]
             })
         )
-
-        summaries[kind] = []
-        statistics[kind] = []
 
         for seed in seeds:
             if seed not in seed_results:
@@ -613,54 +442,273 @@ def aggregate_results(
                         f"at level {level}."
                     )
 
+        rows: list[dict[str, Any]] = []
+
         for level in levels:
-            per_seed = {
-                seed: seed_results[seed][level]
-                for seed in seeds
-            }
+            per_seed = [
+                seed_results[seed][level]["metrics"] for seed in seeds
+            ]
+            names = [
+                name
+                for name in per_seed[0]
+                if all(name in metrics for metrics in per_seed)
+            ]
 
-            row: dict[str, Any] = {"level": level}
+            rows.append({
+                "level": level,
+                "metrics": {
+                    name: _stat([m[name] for m in per_seed])
+                    for name in names
+                },
+            })
 
-            for metric in metric_names:
-                values = [
-                    (
-                        seed_results[seed][level]["baseline"]["metrics"][
-                            metric.removeprefix("baseline_")
-                        ]
-                        if metric.startswith("baseline_")
-                        else seed_results[seed][level]["hopfield"]["metrics"][
-                            metric.removeprefix("hopfield_")
-                        ]
-                    )
-                    for seed in seeds
-                ]
+        summaries[kind] = rows
 
-                row[metric] = benchmark.mean_std(values)
+    return summaries
 
-            row["head_delta"] = (
-                row["hopfield_head_acc"][0]
-                - row["baseline_head_acc"][0]
+
+def aggregate_robustness(
+    raw_results: dict[str, Any],
+    noise_levels: dict[str, list[float]],
+    seeds: list[int],
+) -> dict[str, Any]:
+    """Robustness AUC of each accuracy metric over the noise grid, per seed."""
+    auc: dict[str, Any] = {}
+
+    for kind in benchmark.NOISE_TYPES:
+        levels = sorted({
+            float(level) for level in noise_levels[kind]
+        })
+
+        if len(levels) < 2 or levels[0] != 0.0:
+            raise ValueError(
+                f"{kind} noise grid must contain at least two levels "
+                "and start at 0.0 for robustness AUC."
             )
-            row["proto_delta"] = (
-                row["hopfield_proto_acc"][0]
-                - row["baseline_proto_acc"][0]
-            )
 
-            summaries[kind].append(row)
+        auc[kind] = {}
 
-            for metric in ("head", "proto"):
-                result = calculate_paired_statistics(
-                    per_seed,
-                    metric=metric,
+        for metric in ACCURACY_METRICS:
+            values = [
+                benchmark.robust_auc(
+                    levels,
+                    [
+                        raw_results[kind][seed][level]["metrics"][metric]
+                        for level in levels
+                    ],
                 )
+                for seed in seeds
+            ]
+            auc[kind][metric] = _stat(values)
 
-                statistics[kind].append({
-                    "level": level,
-                    "metric": metric,
-                    **result,
-                })
+    return auc
 
-    return summaries, statistics
+
+def build_prediction_artifacts(
+    raw_results: dict[str, Any],
+    runs: dict[int, benchmark.BaselineRun],
+) -> dict[str, np.ndarray]:
+    """Per-example predictions, correctness and labels for the NPZ file."""
+    artifacts: dict[str, np.ndarray] = {}
+
+    for kind, seed_results in raw_results.items():
+        for seed, level_results in seed_results.items():
+            labels = _tensor_to_numpy(
+                runs[seed].splits.test_labels
+            ).astype(np.int64, copy=False)
+
+            for level, result in level_results.items():
+                for name in ("head", "proto"):
+                    artifacts[
+                        prediction_key(kind, seed, level, f"{name}_pred")
+                    ] = result["predictions"][name]
+
+                    artifacts[
+                        prediction_key(kind, seed, level, f"{name}_correct")
+                    ] = result["correct"][name]
+
+                artifacts[
+                    prediction_key(kind, seed, level, "labels")
+                ] = labels
+
+    return artifacts
+
+
+# ---------------------------------------------------------------------
+# Computational cost measurements (this one model only)
+# ---------------------------------------------------------------------
+
+
+def _aggregate_over_seeds(per_seed: list[dict[str, Any]]) -> dict[str, Any]:
+    """
+    Combine per-seed cost entries into one entry per metric.
+
+    Each input maps metric name -> {"median": ..., ...} for one seed. The
+    output maps metric name -> {"median", "mean", "std", "per_seed"} where
+    "per_seed" holds each seed's own median.
+    """
+    out: dict[str, Any] = {}
+
+    for key, first in per_seed[0].items():
+        if not (isinstance(first, dict) and "median" in first):
+            continue
+
+        values = [float(entry[key]["median"]) for entry in per_seed]
+        mean, std = benchmark.mean_std(values)
+
+        out[key] = {
+            "median": float(np.median(values)),
+            "mean": float(mean),
+            "std": float(std),
+            "per_seed": values,
+        }
+
+    return out
+
+
+def measure_costs(
+    cfg: dict[str, Any],
+    runs: dict[int, benchmark.BaselineRun],
+    nets: dict[int, torch.nn.Module],
+    seeds: list[int],
+    device: torch.device,
+    *,
+    train_times: list[float],
+    prototype_times: list[float],
+    hopfield_build_times: list[float],
+) -> dict[str, Any]:
+    """
+    Measure this variant's cost on EVERY seed and aggregate across seeds.
+
+    Latency, throughput, peak memory and full-evaluation time are measured
+    once per seed (each seed has its own CNN and memory). Parameter counts,
+    MACs and model size do not depend on the seed, so they are taken from
+    the first seed.
+    """
+    c = cfg["cost"]
+
+    timing = {
+        "repeats": c["repeats"],
+        "warmup": c["warmup"],
+        "iters": c["iters"],
+    }
+
+    e7_seeds: list[dict[str, Any]] = []
+    eval_seeds: list[dict[str, Any]] = []
+    e8_seeds: dict[str, list[dict[str, Any]]] = {
+        str(bs): [] for bs in c["batch_sizes"]
+    }
+
+    for seed in seeds:
+        model = nets[seed]
+        run = runs[seed]
+        models: dict[str, torch.nn.Module] = {"model": model}
+
+        print(
+            f"  Cost, seed {seed}: E7 (batch {c['batch_size']}), "
+            "full evaluation, E8 sweep."
+        )
+
+        e7_seeds.append(
+            benchmark.interleaved_cost(
+                models,
+                c["batch_size"],
+                device,
+                **timing,
+            )["model"]
+        )
+
+        eval_times = [
+            benchmark.time_full_evaluation(
+                model,
+                run.splits.test_images,
+                batch_size=c["batch_size"],
+                device=device,
+            )
+            for _ in range(c["repeats"])
+        ]
+        eval_seeds.append({"eval": {"median": float(np.median(eval_times))}})
+
+        for bs in c["batch_sizes"]:
+            e8_seeds[str(bs)].append(
+                benchmark.interleaved_cost(
+                    models,
+                    bs,
+                    device,
+                    **timing,
+                )["model"]
+            )
+
+    # Seed-independent quantities, taken from the first seed.
+    static_seed = seeds[0]
+    model = nets[static_seed]
+
+    assert isinstance(model, benchmark.MnistNet)
+
+    breakdown = benchmark.analytical_macs(model)
+
+    static = {
+        "trainable_params": benchmark.count_trainable_params(model),
+        "buffer_values": benchmark.count_buffer_values(model),
+        "floating_buffer_values": benchmark.count_buffer_values(
+            model,
+            floating_only=True,
+        ),
+        "model_size_bytes": benchmark.model_size_bytes(model),
+        "macs_breakdown": breakdown,
+        "macs_per_image": sum(value for _, value in breakdown),
+        "hook_macs_per_image": benchmark.hook_macs(model),
+    }
+
+    bridge_info = None
+
+    if isinstance(model.bridge, benchmark.HopfieldBridge):
+        bridge = model.bridge
+        prototypes = bridge.prototypes
+
+        bridge_info = {
+            "prototype_shape": list(prototypes.shape),
+            "prototype_dtype": str(prototypes.dtype),
+            "prototype_storage_bytes": (
+                prototypes.numel() * prototypes.element_size()
+            ),
+            "model_size_bytes": benchmark.model_size_bytes(bridge),
+            "buffer_values": benchmark.count_buffer_values(bridge),
+            "floating_buffer_values": benchmark.count_buffer_values(
+                bridge,
+                floating_only=True,
+            ),
+            "trainable_params": benchmark.count_trainable_params(
+                bridge
+            ),
+            "macs_per_image": bridge.macs_per_image(),
+            "beta": bridge.beta,
+            "num_updates": bridge.num_updates,
+            "centered": bridge.center is not None,
+        }
+
+    return {
+        "seeds_measured": list(seeds),
+        "static_seed": static_seed,
+        "num_threads": torch.get_num_threads(),
+        "device": str(device),
+        "batch_size": c["batch_size"],
+        "e7": _aggregate_over_seeds(e7_seeds),
+        "e8": {
+            bs: _aggregate_over_seeds(entries)
+            for bs, entries in e8_seeds.items()
+        },
+        "eval_time_s": _aggregate_over_seeds(eval_seeds)["eval"],
+        "static": static,
+        "bridge": bridge_info,
+        "train_time_s": benchmark.mean_std(train_times),
+        "prototype_time_s": benchmark.mean_std(prototype_times),
+        "hopfield_build_time_s": (
+            benchmark.mean_std(hopfield_build_times)
+            if hopfield_build_times
+            else None
+        ),
+    }
 
 
 # ---------------------------------------------------------------------
@@ -674,13 +722,15 @@ def run_experiment(
     selection: str,
     retrain: bool = False,
 ) -> dict[str, Any]:
-    """Evaluate CNN and CNN + Hopfield with the selected memory method."""
+    """Evaluate ONE variant: the CNN baseline or CNN + one Hopfield memory."""
     normalize_for_selection = _normalize_selection_flag(selection)
-    method_name, space_description, _ = _describe_selection(selection)
+    method_name, space_description = _describe_selection(selection)
+    is_baseline = selection == "baseline"
 
     per_class = cfg["prototypes_per_class"]
     center = cfg["center_prototypes"]
     num_classes = NUM_MNIST_CLASSES
+    seeds = [int(seed) for seed in cfg["seeds"]]
 
     threads = benchmark.configure_threads(
         cfg["cost"]["num_threads"]
@@ -692,15 +742,16 @@ def run_experiment(
         f"torch {torch.__version__}"
     )
     print(
-        f"Memory selection: {method_name}; "
+        f"Variant: {method_name}; "
         f"selection space = {space_description}; "
         "memory storage = raw embeddings."
     )
-    print(
-        "Memory timing: "
-        f"{MEMORY_TIMING_WARMUPS} warmup and "
-        f"{MEMORY_TIMING_REPEATS} measured repetitions per method."
-    )
+    if not is_baseline:
+        print(
+            "Memory timing: "
+            f"{MEMORY_TIMING_WARMUPS} warmup and "
+            f"{MEMORY_TIMING_REPEATS} measured repetitions."
+        )
 
     data = benchmark.load_mnist(cfg["data_dir"])
 
@@ -719,23 +770,18 @@ def run_experiment(
     noise_levels = benchmark.noise_grids(cfg)
 
     runs: dict[int, benchmark.BaselineRun] = {}
-    memories: dict[int, torch.Tensor] = {}
-    memory_label_sets: dict[int, torch.Tensor] = {}
     nets: dict[int, torch.nn.Module] = {}
+    fingerprints: dict[str, dict[str, str]] = {}
 
     curves: list[list[float]] = []
 
-    selected_times: list[float] = []
-    herding_memory_times: list[float] = []
-    kmeans_memory_times: list[float] = []
+    selection_medians: list[float] = []
+    selection_samples: dict[str, list[float]] = {}
     prototype_times: list[float] = []
     hopfield_build_times: list[float] = []
 
-    herding_timing_samples: dict[int, list[float]] = {}
-    kmeans_timing_samples: dict[int, list[float]] = {}
-
-    # Stage 1: Prepare CNN, memory banks, and Hopfield networks.
-    for seed in cfg["seeds"]:
+    # Stage 1: Prepare the CNN and, for Hopfield variants, the memory bank.
+    for seed in seeds:
         run = benchmark.prepare_baseline_run(
             cfg,
             data,
@@ -744,38 +790,34 @@ def run_experiment(
             retrain=retrain,
         )
 
+        runs[seed] = run
         prototype_times.append(run.prototype_time_s)
+        fingerprints[str(seed)] = {
+            "cnn": _fingerprint_net(run.net),
+            "test_labels": _fingerprint_labels(run.splits.test_labels),
+        }
+
+        if is_baseline:
+            nets[seed] = run.net
+            print(f"Prepared seed {seed}: baseline CNN (no memory).")
+            continue
 
         (
             memory,
             memory_labels,
             center_offset,
-            herding_elapsed,
-            kmeans_elapsed,
-            herding_samples,
-            kmeans_samples,
-        ) = measure_memory_builds(
+            selection_elapsed,
+            samples,
+        ) = measure_memory_build(
             run,
             per_class=per_class,
             center=center,
             num_classes=num_classes,
-            normalize_for_selection=normalize_for_selection,
             selection=selection,
         )
 
-        # Time of the method that actually supplies the memory.
-        selected_elapsed = (
-            kmeans_elapsed
-            if selection == "kmeans"
-            else herding_elapsed
-        )
-
-        selected_times.append(selected_elapsed)
-        herding_memory_times.append(herding_elapsed)
-        kmeans_memory_times.append(kmeans_elapsed)
-
-        herding_timing_samples[seed] = herding_samples
-        kmeans_timing_samples[seed] = kmeans_samples
+        selection_medians.append(selection_elapsed)
+        selection_samples[str(seed)] = samples
 
         _sync_if_cuda(run.device)
         hopfield_build_start = time.perf_counter()
@@ -795,310 +837,148 @@ def run_experiment(
         )
         hopfield_build_times.append(hopfield_build_elapsed)
 
-        runs[seed] = run
-        memories[seed] = memory
-        memory_label_sets[seed] = memory_labels
         nets[seed] = hop_net
 
-        seed_curve = benchmark.beta_curve(
-            hop_net,
-            run,
-            beta_values,
-            validation_sets,
+        curves.append(
+            benchmark.beta_curve(
+                hop_net,
+                run,
+                beta_values,
+                validation_sets,
+            )
         )
-        curves.append(seed_curve)
 
         print(
             f"Prepared seed {seed}: "
             f"{per_class} memories per class; "
-            f"selected method = {selection}; "
-            f"Herding median = {herding_elapsed:.4f}s; "
-            f"K-means median = {kmeans_elapsed:.4f}s; "
-            f"selected-method time = {selected_elapsed:.4f}s; "
+            f"{method_name} median = {selection_elapsed:.4f}s; "
             f"Hopfield construction = {hopfield_build_elapsed:.4f}s."
         )
 
-    # Stage 2: Select beta using the mean validation curve.
-    selected_beta, validation_mean_curve = benchmark.select_beta(
-        beta_values,
-        curves,
-    )
+    # Stage 2: Select beta using the mean validation curve (Hopfield only).
+    selected_beta = None
+    validation_mean_curve = None
 
-    print(
-        f"Validation-selected beta for {selection}: "
-        f"{selected_beta:g}"
-    )
-
-    # Stage 3: Evaluate clean and corrupted test embeddings.
-    raw_results: dict[str, Any] = {
-        kind: {}
-        for kind in ("clean", *benchmark.NOISE_TYPES)
-    }
-
-    for seed in cfg["seeds"]:
-        run = runs[seed]
-        net = nets[seed]
-
-        assert isinstance(net, benchmark.MnistNet)
-        assert isinstance(net.bridge, benchmark.HopfieldBridge)
-
-        net.bridge.set_retrieval(
-            beta=selected_beta,
-            num_updates=1,
+    if not is_baseline:
+        selected_beta, validation_mean_curve = benchmark.select_beta(
+            beta_values,
+            curves,
         )
 
-        clean_embeddings = run.test_embeddings("gaussian", 0.0)
+        print(
+            f"Validation-selected beta for {selection}: "
+            f"{selected_beta:g}"
+        )
 
-        for noise_kind in benchmark.NOISE_TYPES:
-            zero_noise_embeddings = run.test_embeddings(
-                noise_kind,
-                0.0,
+        for seed in seeds:
+            net = nets[seed]
+
+            assert isinstance(net, benchmark.MnistNet)
+            assert isinstance(net.bridge, benchmark.HopfieldBridge)
+
+            net.bridge.set_retrieval(
+                beta=selected_beta,
+                num_updates=1,
             )
 
-            if not torch.equal(
-                zero_noise_embeddings,
-                clean_embeddings,
-            ):
-                max_difference = (
-                    zero_noise_embeddings - clean_embeddings
-                ).abs().max().item()
+    # Stage 3: Evaluate clean and corrupted TEST embeddings.
+    raw_results: dict[str, Any] = {
+        kind: {} for kind in ("clean", *benchmark.NOISE_TYPES)
+    }
 
-                raise RuntimeError(
-                    f"{noise_kind} at noise level 0.0 does not "
-                    f"match clean embeddings for seed {seed}. "
-                    f"Maximum absolute difference: {max_difference}."
-                )
-
-        clean_result = evaluate_pair(
-            run,
-            net,
-            clean_embeddings,
+    for seed in seeds:
+        per_kind = evaluate_conditions(
+            runs[seed],
+            nets[seed],
+            noise_levels,
+            seed,
         )
 
-        raw_results["clean"][seed] = {
-            0.0: clean_result
-        }
-
-        for noise_kind in benchmark.NOISE_TYPES:
-            configured_levels = [
-                float(level)
-                for level in noise_levels[noise_kind]
-            ]
-
-            if (
-                not configured_levels
-                or configured_levels[0] != 0.0
-            ):
-                raise ValueError(
-                    f"{noise_kind} noise grid must start at 0.0."
-                )
-
-            seed_results = {0.0: clean_result}
-
-            for level in configured_levels:
-                if level == 0.0:
-                    continue
-
-                test_embeddings = run.test_embeddings(
-                    noise_kind,
-                    level,
-                )
-
-                seed_results[level] = evaluate_pair(
-                    run,
-                    net,
-                    test_embeddings,
-                )
-
-            raw_results[noise_kind][seed] = seed_results
+        for kind, per_level in per_kind.items():
+            raw_results[kind][seed] = per_level
 
         print(f"Evaluated seed {seed}.")
 
-    # Stage 4: Aggregate accuracy and statistical results.
-    metric_names = (
-        "baseline_head_acc",
-        "hopfield_head_acc",
-        "baseline_proto_acc",
-        "hopfield_proto_acc",
-    )
+    # Stage 4: Aggregate accuracy / retrieval, then robustness AUC.
+    summaries = aggregate_results(raw_results, noise_levels, seeds)
+    robustness = aggregate_robustness(raw_results, noise_levels, seeds)
 
-    summaries, statistics = aggregate_results(
-        raw_results,
-        noise_levels,
-        list(cfg["seeds"]),
-        metric_names,
-    )
+    # Stage 5: Measure computational cost on every seed (this model only).
+    print("\nMeasuring computational cost on every seed.")
 
-    # Stage 5: Calculate robustness AUC separately per seed.
-    auc: dict[str, Any] = {}
-
-    for kind in benchmark.NOISE_TYPES:
-        levels = sorted({
-            float(level)
-            for level in noise_levels[kind]
-        })
-
-        if len(levels) < 2 or levels[0] != 0.0:
-            raise ValueError(
-                f"{kind} noise grid must contain at least two levels "
-                "and start at 0.0 for robustness AUC."
-            )
-
-        per_seed: dict[str, list[float]] = {
-            "baseline": [],
-            "hopfield": [],
-        }
-
-        for seed in cfg["seeds"]:
-            seed_results = raw_results[kind][seed]
-
-            for model in ("baseline", "hopfield"):
-                accuracies = [
-                    seed_results[level][model]["metrics"]["head_acc"]
-                    for level in levels
-                ]
-
-                seed_auc = benchmark.robust_auc(
-                    levels,
-                    accuracies,
-                )
-                per_seed[model].append(seed_auc)
-
-        auc[kind] = {
-            model: benchmark.mean_std(values)
-            for model, values in per_seed.items()
-        }
-
-        auc_seed_deltas = [
-            hopfield_auc - baseline_auc
-            for baseline_auc, hopfield_auc in zip(
-                per_seed["baseline"],
-                per_seed["hopfield"],
-            )
-        ]
-
-        auc[kind]["delta"] = (
-            auc[kind]["hopfield"][0]
-            - auc[kind]["baseline"][0]
-        )
-
-        # Same across-seed paired statistics as the shared benchmark.
-        auc[kind].update(
-            benchmark.seed_stats(auc_seed_deltas)
-        )
-
-    # Stage 6: Measure computational costs.
-    cost_seed = cfg["seeds"][0]
-    cost_run = runs[cost_seed]
-    cost_hop = nets[cost_seed]
-
-    assert isinstance(cost_hop, benchmark.MnistNet)
-
-    print(
-        f"\nMeasuring computational costs using seed {cost_seed}."
-    )
-
-    cost_results = measure_herding_costs(
+    cost_results = measure_costs(
         cfg,
-        cost_run,
-        cost_hop,
-        selected_beta,
+        runs,
+        nets,
+        seeds,
         device,
-        train_times=[
-            runs[seed].train_time_s
-            for seed in cfg["seeds"]
-        ],
+        train_times=[runs[seed].train_time_s for seed in seeds],
         prototype_times=prototype_times,
-        selected_times=selected_times,
-        herding_memory_times=herding_memory_times,
         hopfield_build_times=hopfield_build_times,
-        kmeans_memory_times=kmeans_memory_times,
-        representative_seed=cost_seed,
     )
 
-    # Stage 7: Prepare prediction artifacts.
-    prediction_artifacts: dict[str, np.ndarray] = {}
+    # Stage 6: Package results.
+    selection_time = None
 
-    for kind, seed_results in raw_results.items():
-        for seed, level_results in seed_results.items():
-            for level, pair in level_results.items():
-                level_key = format(
-                    float(level),
-                    ".8g",
-                ).replace(".", "p")
+    if not is_baseline:
+        selection_time = {
+            "per_seed_median_s": selection_medians,
+            "mean_std_s": [
+                float(v) for v in benchmark.mean_std(selection_medians)
+            ],
+            "samples_s": selection_samples,
+            "warmups": MEMORY_TIMING_WARMUPS,
+            "repeats": MEMORY_TIMING_REPEATS,
+            "per_seed_summary": "median",
+        }
 
-                prefix = (
-                    f"{kind}__seed_{seed}__level_{level_key}"
-                )
-
-                for model_name in ("baseline", "hopfield"):
-                    model_result = pair[model_name]
-
-                    for prediction_type in ("head", "proto"):
-                        prediction_artifacts[
-                            f"{prefix}__{model_name}_{prediction_type}_pred"
-                        ] = model_result["predictions"][prediction_type]
-
-                        prediction_artifacts[
-                            f"{prefix}__{model_name}_{prediction_type}_correct"
-                        ] = model_result["correct"][prediction_type]
-
-                prediction_artifacts[f"{prefix}__labels"] = (
-                    _tensor_to_numpy(
-                        runs[seed].splits.test_labels
-                    ).astype(np.int64, copy=False)
-                )
-
-    # Stage 8: Return experiment results.
-    return {
+    result = {
+        "schema_version": SCHEMA_VERSION,
+        "selection": selection,
+        "method": selection,
+        "method_label": method_name,
+        "normalize_for_selection": normalize_for_selection,
         "config": cfg,
         "environment": benchmark.environment_info(device),
-        "selection": selection,
-        "normalize_for_selection": normalize_for_selection,
-        "beta_selection_sets": list(validation_sets),
-        "selected_beta": selected_beta,
-        "validation_mean_curve": validation_mean_curve,
-        # Time of the method that supplied the Hopfield memory.
-        "selection_time_s": benchmark.mean_std(selected_times),
-        # Both methods are timed in every run.
-        "herding_memory_time_s": benchmark.mean_std(
-            herding_memory_times
-        ),
-        "kmeans_memory_time_s": benchmark.mean_std(
-            kmeans_memory_times
-        ),
-        "prototype_time_s": benchmark.mean_std(prototype_times),
-        "hopfield_build_time_s": benchmark.mean_std(
-            hopfield_build_times
-        ),
-        "memory_timing": {
-            "warmups_per_method_per_seed": MEMORY_TIMING_WARMUPS,
-            "measured_repeats_per_method_per_seed": (
-                MEMORY_TIMING_REPEATS
-            ),
-            "per_seed_summary": "median",
-            "herding_samples_s": herding_timing_samples,
-            "kmeans_samples_s": kmeans_timing_samples,
-        },
-        "cost": cost_results,
-        "raw_results": raw_results,
-        "summaries": summaries,
-        "statistics": statistics,
-        "robustness_auc": auc,
-        "prediction_artifacts": prediction_artifacts,
-        "memory": {
+        "seeds": seeds,
+        "fingerprints": fingerprints,
+        "memory": None if is_baseline else {
             "per_class": per_class,
             "num_classes": num_classes,
             "total_patterns": per_class * num_classes,
             "centered": center,
-            "embedding_dim": int(
-                runs[cfg["seeds"][0]].z_train.shape[1]
-            ),
+            "embedding_dim": int(runs[seeds[0]].z_train.shape[1]),
             "method": method_name,
             "selection_normalized": normalize_for_selection,
             "selection_space": selection,
             "storage_representation": "raw",
         },
+        "beta_values": list(beta_values),
+        "beta_selection_sets": list(validation_sets),
+        "selected_beta": selected_beta,
+        "validation_mean_curve": validation_mean_curve,
+        "selection_time": selection_time,
+        "hopfield_build_time_s": (
+            None
+            if is_baseline
+            else [
+                float(v)
+                for v in benchmark.mean_std(hopfield_build_times)
+            ]
+        ),
+        "prototype_time_s": [
+            float(v) for v in benchmark.mean_std(prototype_times)
+        ],
+        "summaries": summaries,
+        "robustness_auc": robustness,
+        "cost": cost_results,
+    }
+
+    return {
+        "result": result,
+        "prediction_artifacts": build_prediction_artifacts(
+            raw_results, runs
+        ),
     }
 
 
@@ -1111,22 +991,10 @@ def _json_safe(value: Any) -> Any:
     """
     Convert nested results into JSON-compatible values.
 
-    Per-example arrays are stored in the NPZ artifact. They are omitted
-    from JSON to avoid duplicating large prediction and correctness
-    arrays.
+    Per-example arrays live in the NPZ artifact, not in the JSON.
     """
-    excluded_keys = {
-        "prediction_artifacts",
-        "predictions",
-        "correct",
-    }
-
     if isinstance(value, dict):
-        return {
-            str(key): _json_safe(item)
-            for key, item in value.items()
-            if key not in excluded_keys
-        }
+        return {str(key): _json_safe(item) for key, item in value.items()}
 
     if isinstance(value, (list, tuple)):
         return [_json_safe(item) for item in value]
@@ -1155,431 +1023,240 @@ def _json_safe(value: Any) -> Any:
 
 
 def save_results(
-    raw: dict[str, Any],
+    output: dict[str, Any],
     output_dir: Path,
 ) -> None:
-    """Save experiment results and prediction artifacts."""
+    """Save this variant's artifacts (JSON, NPZ, CSV, Markdown)."""
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    selection = raw["selection"]
+    result = output["result"]
+    selection = result["selection"]
 
-    # JSON: summary and scalar results, not per-example arrays.
-    json_payload = _json_safe(raw)
-
-    (output_dir / "herding_comparison.json").write_text(
-        json.dumps(
-            json_payload,
-            indent=2,
-            default=str,
-        ),
+    # JSON: summaries, robustness, selection time, cost, fingerprints.
+    (output_dir / JSON_NAME).write_text(
+        json.dumps(_json_safe(result), indent=2, default=str),
         encoding="utf-8",
     )
 
-    # NPZ: per-example predictions, labels, and correctness.
+    # NPZ: per-example labels, predictions and correctness.
     np.savez_compressed(
-        output_dir / "herding_predictions.npz",
-        **raw["prediction_artifacts"],
+        output_dir / NPZ_NAME,
+        **output["prediction_artifacts"],
     )
 
-    # CSV.
+    # CSV: one row per (condition, level).
     rows: list[dict[str, Any]] = []
 
-    for kind, points in raw["summaries"].items():
+    for kind, points in result["summaries"].items():
         for point in points:
-            row = {
+            row: dict[str, Any] = {
                 "selection": selection,
                 "condition": kind,
                 "level": point["level"],
-                "baseline_head_mean": point["baseline_head_acc"][0],
-                "baseline_head_std": point["baseline_head_acc"][1],
-                "hopfield_head_mean": point["hopfield_head_acc"][0],
-                "hopfield_head_std": point["hopfield_head_acc"][1],
-                "head_delta": point["head_delta"],
-                "baseline_proto_mean": point["baseline_proto_acc"][0],
-                "baseline_proto_std": point["baseline_proto_acc"][1],
-                "hopfield_proto_mean": point["hopfield_proto_acc"][0],
-                "hopfield_proto_std": point["hopfield_proto_acc"][1],
-                "proto_delta": point["proto_delta"],
             }
 
-            for metric in ("head", "proto"):
-                stat = next(
-                    item
-                    for item in raw["statistics"][kind]
-                    if (
-                        item["level"] == point["level"]
-                        and item["metric"] == metric
-                    )
-                )
-
-                row[f"{metric}_mcnemar_p_max"] = (
-                    stat["mcnemar_p_max"]
-                )
-                row[f"{metric}_wilcoxon_p"] = stat["wilcoxon_p"]
-                row[f"{metric}_winner"] = stat["winner"]
+            for name, stat in point["metrics"].items():
+                row[f"{name}_mean"] = stat["mean"]
+                row[f"{name}_std"] = stat["std"]
 
             rows.append(row)
 
-    if rows:
-        with (
-            output_dir / "herding_comparison.csv"
-        ).open(
-            "w",
-            newline="",
-            encoding="utf-8",
-        ) as file:
-            writer = csv.DictWriter(
-                file,
-                fieldnames=list(rows[0]),
-            )
-            writer.writeheader()
-            writer.writerows(rows)
+    fieldnames: list[str] = []
 
-    # Markdown report.
-    cost = raw["cost"]
+    for row in rows:
+        for key in row:
+            if key not in fieldnames:
+                fieldnames.append(key)
 
-    method_description, selection_description, herding_label = (
-        _describe_selection(selection)
-    )
+    with (output_dir / CSV_NAME).open(
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
 
-    timing_protocol = raw["memory_timing"]
+    # Markdown report for this single variant.
+    cost = result["cost"]
+    method_name, space_description = _describe_selection(selection)
+    selection_time = result["selection_time"]
 
     lines = [
-        "# MNIST Memory Selection Experiment",
+        f"# MNIST memory experiment: {method_name}",
         "",
-        f"- Memory selection method: **{method_description}**",
-        f"- Selection variant: **{selection.upper()}**",
-        f"- Selection space: {selection_description}",
-        "- Storage representation: original raw embeddings",
-        f"- Seeds: {raw['config']['seeds']}",
-        (
-            f"- Memory: {raw['memory']['total_patterns']} patterns "
-            f"({raw['memory']['per_class']} per class)"
-        ),
-        f"- Embedding dimension: {raw['memory']['embedding_dim']}",
-        f"- Centered: {raw['memory']['centered']}",
-        f"- Beta selection sets: {raw['beta_selection_sets']}",
-        "",
-        "## Validation-selected beta",
-        "",
-        f"- {method_description}: `{raw['selected_beta']:g}`",
-        "",
-        "## Memory construction time",
-        "",
-        (
-            f"- Selected method ({method_description}): "
-            f"{raw['selection_time_s'][0]:.4f} "
-            f"± {raw['selection_time_s'][1]:.4f} seconds"
-        ),
-        (
-            f"- {herding_label} (timing comparison): "
-            f"{raw['herding_memory_time_s'][0]:.4f} "
-            f"± {raw['herding_memory_time_s'][1]:.4f} seconds"
-        ),
-        (
-            f"- K-means (timing comparison): "
-            f"{raw['kmeans_memory_time_s'][0]:.4f} "
-            f"± {raw['kmeans_memory_time_s'][1]:.4f} seconds"
-        ),
-        (
-            f"- Warmups per method per seed: "
-            f"{timing_protocol['warmups_per_method_per_seed']}"
-        ),
-        (
-            f"- Measured repetitions per method per seed: "
-            f"{timing_protocol['measured_repeats_per_method_per_seed']}"
-        ),
-        "- Per-seed timing summary: median",
-        "- Measurement order: alternating",
-        "",
-        (
-        "Both memory construction measurements start with "
-        "precomputed training embeddings."
-        ),
-        "",
-        "## Timing components",
-        "",
-        (
-            f"- Training embedding extraction and class-prototype "
-            f"construction: {raw['prototype_time_s'][0]:.4f} "
-            f"± {raw['prototype_time_s'][1]:.4f} seconds"
-        ),
-        (
-            f"- {herding_label} memory construction: "
-            f"{raw['herding_memory_time_s'][0]:.4f} "
-            f"± {raw['herding_memory_time_s'][1]:.4f} seconds"
-        ),
-        (
-            f"- K-means memory construction: "
-            f"{raw['kmeans_memory_time_s'][0]:.4f} "
-            f"± {raw['kmeans_memory_time_s'][1]:.4f} seconds"
-        ),
-        (
-            f"- Hopfield network construction: "
-            f"{raw['hopfield_build_time_s'][0]:.4f} "
-            f"± {raw['hopfield_build_time_s'][1]:.4f} seconds"
-        ),
-        "",
-        (
-        "These are separate timing components, not a claim of "
-        "complete experiment setup time."
-        ),
-        "",
-        "## Computational cost",
-        "",
-        f"- Representative seed: {cost['representative_seed']}",
-        f"- Device: `{cost['device']}`",
-        f"- CPU threads: {cost['num_threads']}",
-        "",
-        "### E7: Full-model inference cost",
-        "",
-       (
-        "| Model | Latency p50 (ms) | Latency p95 (ms) | "
-        "Latency/image (µs) | Throughput (images/s) | "
-        "Peak memory estimate (MB) |"
-        ),
-        "|---|---:|---:|---:|---:|---:|",
+        f"- Variant: **{selection}**",
+        f"- Selection space: {space_description}",
+        f"- Seeds: {result['seeds']}",
     ]
 
-    for name in ("baseline", "hopfield"):
-        result = cost["e7"][name]
-        lines.append(
-            f"| {name} "
-            f"| {result['latency_ms_p50']['median']:.4f} "
-            f"| {result['latency_ms_p95']['median']:.4f} "
-            f"| {result['latency_per_image_us']['median']:.4f} "
-            f"| {result['throughput_img_s']['median']:.4f} "
-            f"| {result['peak_mem_mb']['median']:.4f} |"
-        )
+    if result["memory"] is not None:
+        memory = result["memory"]
+        lines += [
+            (
+                f"- Memory: {memory['total_patterns']} patterns "
+                f"({memory['per_class']} per class)"
+            ),
+            f"- Embedding dimension: {memory['embedding_dim']}",
+            f"- Centered: {memory['centered']}",
+            f"- Beta selection sets: {result['beta_selection_sets']}",
+            f"- Validation-selected beta: `{result['selected_beta']:g}`",
+        ]
+    else:
+        lines.append("- Memory: none (CNN head only)")
 
+    # 1. Classification accuracy.
+    lines += ["", "## 1. Classification accuracy (head_acc)", ""]
     lines += [
-        "",
-        "### Full test-set evaluation time",
-        "",
-        "| Model | Median (s) | IQR (s) |",
+        "| Condition | Level | head_acc |",
         "|---|---:|---:|",
     ]
 
-    for name in ("baseline", "hopfield"):
-        result = cost["eval_time_s"][name]
-        lines.append(
-            f"| {name} | {result['median']:.4f} "
-            f"| {result['iqr']:.4f} |"
-        )
-
-    lines += [
-        "",
-        "### E8: Inference cost across batch sizes",
-        "",
-       (
-        "| Batch size | Model | Latency p50 (ms) | "
-        "Latency/image (µs) | Throughput (images/s) |"
-    ),
-        "|---:|---|---:|---:|---:|",
-    ]
-
-    for batch_size, models in cost["e8"].items():
-        for name in ("baseline", "hopfield"):
-            result = models[name]
-            lines.append(
-                f"| {batch_size} | {name} "
-                f"| {result['latency_ms_p50']['median']:.4f} "
-                f"| {result['latency_per_image_us']['median']:.4f} "
-                f"| {result['throughput_img_s']['median']:.4f} |"
-            )
-
-    lines += [
-        "",
-        "### Complete-model computational footprint",
-        "",
-       (
-        "| Model | Trainable parameters | Buffer values | "
-        "Serialized size (bytes) | Analytical MACs/image | "
-        "Hook MACs/image |"
-        ),
-        "|---|---:|---:|---:|---:|---:|",
-    ]
-
-    for name in ("baseline", "hopfield"):
-        result = cost["static"][name]
-        lines.append(
-            f"| {name} "
-            f"| {result['trainable_params']} "
-            f"| {result['buffer_values']} "
-            f"| {result['model_size_bytes']} "
-            f"| {result['macs_per_image']} "
-            f"| {result['hook_macs_per_image']} |"
-        )
-
-    bridge = cost["hopfield_bridge"]
-
-    lines += [
-        "",
-        "### Isolated Hopfield bridge footprint",
-        "",
-        f"- Prototype shape: `{bridge['prototype_shape']}`",
-        f"- Prototype dtype: `{bridge['prototype_dtype']}`",
-        (
-            f"- Prototype tensor storage: "
-            f"{bridge['prototype_storage_bytes']} bytes"
-        ),
-        (
-            f"- Serialized bridge state: "
-            f"{bridge['model_size_bytes']} bytes"
-        ),
-        f"- Bridge buffer values: {bridge['buffer_values']}",
-        (
-            f"- Floating-point bridge buffer values: "
-            f"{bridge['floating_buffer_values']}"
-        ),
-        (
-            f"- Trainable bridge parameters: "
-            f"{bridge['trainable_params']}"
-        ),
-        f"- Bridge MACs per image: {bridge['macs_per_image']}",
-        f"- Retrieval beta: `{bridge['beta']:g}`",
-        f"- Retrieval updates: {bridge['num_updates']}",
-        f"- Centered: {bridge['centered']}",
-        "",
-    ]
-
-    # Accuracy and statistical results.
-    for kind, points in raw["summaries"].items():
-        lines += [
-            f"## {kind.title()} evaluation",
-            "",
-            (
-                "| Level | CNN head accuracy | "
-                "Hopfield head accuracy | Δ head | "
-                "CNN retrieval accuracy | "
-                "Hopfield retrieval accuracy | Δ retrieval |"
-            ),
-            "|---:|---:|---:|---:|---:|---:|---:|",
-        ]
-
+    for kind, points in result["summaries"].items():
         for point in points:
+            stat = point["metrics"]["head_acc"]
             lines.append(
-                f"| {point['level']:g} "
-                f"| {point['baseline_head_acc'][0]:.4f} "
-                f"± {point['baseline_head_acc'][1]:.4f} "
-                f"| {point['hopfield_head_acc'][0]:.4f} "
-                f"± {point['hopfield_head_acc'][1]:.4f} "
-                f"| {point['head_delta']:+.4f} "
-                f"| {point['baseline_proto_acc'][0]:.4f} "
-                f"± {point['baseline_proto_acc'][1]:.4f} "
-                f"| {point['hopfield_proto_acc'][0]:.4f} "
-                f"± {point['hopfield_proto_acc'][1]:.4f} "
-                f"| {point['proto_delta']:+.4f} |"
+                f"| {kind} | {point['level']:g} "
+                f"| {stat['mean']:.4f} ± {stat['std']:.4f} |"
             )
 
-        lines += [
-            "",
-            f"### {kind.title()} statistical comparisons",
-            "",
-            (
-            "| Level | Metric | Δ | McNemar max p | "
-            "Wilcoxon p | Winner |"
-            ),
-            "|---:|---|---:|---:|---:|---|",
-        ]
-
-        for stat in raw["statistics"][kind]:
-            wilcoxon_text = (
-                "N/A"
-                if stat["wilcoxon_p"] is None
-                else f"{stat['wilcoxon_p']:.6g}"
-            )
-
-            lines.append(
-                f"| {stat['level']:g} "
-                f"| {stat['metric']} "
-                f"| {stat['delta']:+.4f} "
-                f"| {stat['mcnemar_p_max']:.6g} "
-                f"| {wilcoxon_text} "
-                f"| {stat['winner']} |"
-            )
-
-        lines.append("")
-
-    # Robustness AUC, including paired across-seed statistics.
+    # 2. Robustness.
     lines += [
-        "## Robustness AUC",
         "",
-       (
-        "| Noise type | CNN AUC | Hopfield AUC | Δ | "
-        "Seeds favoring Hopfield | Seeds favoring CNN | Wilcoxon p |"
-        ),
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "## 2. Robustness AUC",
+        "",
+        "| Noise type | head_acc AUC | proto_acc AUC |",
+        "|---|---:|---:|",
     ]
 
-    for kind, stats in raw["robustness_auc"].items():
-        wilcoxon_text = (
-            "N/A"
-            if stats["wilcoxon_p"] is None
-            else f"{stats['wilcoxon_p']:.6g}"
-        )
-
+    for kind, stats in result["robustness_auc"].items():
         lines.append(
             f"| {kind} "
-            f"| {stats['baseline'][0]:.4f} "
-            f"± {stats['baseline'][1]:.4f} "
-            f"| {stats['hopfield'][0]:.4f} "
-            f"± {stats['hopfield'][1]:.4f} "
-            f"| {stats['delta']:+.4f} "
-            f"| {stats['n_pos']} "
-            f"| {stats['n_neg']} "
-            f"| {wilcoxon_text} |"
+            f"| {stats['head_acc']['mean']:.4f} "
+            f"± {stats['head_acc']['std']:.4f} "
+            f"| {stats['proto_acc']['mean']:.4f} "
+            f"± {stats['proto_acc']['std']:.4f} |"
         )
+
+    # 3. Retrieval performance (clean).
+    lines += [
+        "",
+        "## 3. Retrieval performance (clean test data)",
+        "",
+        "| Metric | Mean ± std |",
+        "|---|---:|",
+    ]
+
+    for name, stat in result["summaries"]["clean"][0]["metrics"].items():
+        lines.append(
+            f"| {name} | {stat['mean']:.4f} ± {stat['std']:.4f} |"
+        )
+
+    # 4. Memory selection time.
+    lines += ["", "## 4. Memory selection time", ""]
+
+    if selection_time is None:
+        lines.append("- Not applicable: the baseline builds no memory.")
+    else:
+        mean, std = selection_time["mean_std_s"]
+        lines += [
+            f"- {method_name}: {mean:.4f} ± {std:.4f} seconds",
+            f"- Warmups per seed: {selection_time['warmups']}",
+            f"- Measured repetitions per seed: {selection_time['repeats']}",
+            "- Per-seed summary: median",
+            (
+                f"- Hopfield network construction: "
+                f"{result['hopfield_build_time_s'][0]:.4f} "
+                f"± {result['hopfield_build_time_s'][1]:.4f} seconds"
+            ),
+        ]
+
+    lines += [
+        (
+            f"- Embedding extraction and class prototypes: "
+            f"{result['prototype_time_s'][0]:.4f} "
+            f"± {result['prototype_time_s'][1]:.4f} seconds"
+        ),
+    ]
+
+    # 5. Computational cost.
+    e7 = cost["e7"]
+    static = cost["static"]
 
     lines += [
         "",
-        "## Methodology and interpretation notes",
+        "## 5. Computational cost",
         "",
-        "- K-means selects cluster representatives; Herding selects actual training embeddings.",
-        "- Selection is performed independently for each class.",
-        f"- The selection representation is {selection_description}.",
-        "- Selected memories are stored using raw CNN embedding space.",
-        "- The global Hopfield centering offset is calculated from raw training embeddings.",
-        "- The CNN is shared between baseline and Hopfield evaluation.",
-        "- Both evaluations use identical frozen CNN embeddings.",
-        "- Both models receive identical noisy test inputs for each seed and condition.",
-        "- Noise corruption is generated using the shared seeded corruption procedure.",
-        "- The memory budget is fixed across all seeds.",
-        "- Beta is selected using validation data.",
-        f"- The Hopfield bridge uses the {method_description}-selected memory bank.",
-        "- This run compares the selected Hopfield model against the CNN baseline only; direct Herding-vs-K-means tests come from the separate comparison script using the saved predictions.",
-        "- McNemar tests compare paired per-example correctness.",
-        "- McNemar p-values are calculated per seed; the maximum is used for winner decisions.",
-        "- Wilcoxon signed-rank tests operate on per-seed accuracy differences.",
-        "- Wilcoxon is calculated only when the shared minimum-seed requirement is met.",
-        "- Winner decisions use the shared benchmark's decision function and thresholds.",
-        "- Memory construction timings exclude CNN embedding extraction and Hopfield construction.",
-        "- Memory timing uses one warmup and three measured repetitions per method and seed.",
-        "- The order of measured K-means and Herding runs alternates.",
-        "- Per-seed memory construction time is summarized by the median of measured repetitions.",
-        "- In a K-means run, the Herding timing uses raw-embedding Herding and is for timing comparison only.",
-        "- Prototype timing includes training embedding extraction and class-prototype construction.",
-        "- Hopfield construction timing is reported separately.",
-        "- E7 and E8 use interleaved model ordering to reduce timing-order bias.",
-        "- Full-model latency includes the CNN and its bridge.",
-        "- Isolated Hopfield bridge storage and MACs are reported separately.",
-        "- Model size is the serialized state_dict size.",
-        "- Analytical and hook-based MAC counts are reported separately.",
-        "- Full test-set evaluation time is measured over the complete test images.",
-        "- CPU peak-memory estimates are not measurements of total process RAM.",
-        "- All selection modes use the same memory budget, centering rule, beta candidates, and evaluation protocol.",
-        "- The L2 variant changes the selection objective, not the representation stored in Hopfield memory.",
+        f"- Timing measured on seeds: {cost['seeds_measured']} "
+        "(mean ± std over seeds)",
+        f"- Device: `{cost['device']}`; CPU threads: {cost['num_threads']}",
+        (
+            f"- E7 (batch {cost['batch_size']}): latency p50 "
+            f"{_ms(e7['latency_ms_p50'])} ms, p95 "
+            f"{_ms(e7['latency_ms_p95'])} ms, "
+            f"{_ms(e7['latency_per_image_us'])} µs/image, "
+            f"{_ms(e7['throughput_img_s'])} images/s, "
+            f"peak memory estimate {_ms(e7['peak_mem_mb'])} MB"
+        ),
+        f"- Full test-set evaluation: {_ms(cost['eval_time_s'])} s",
+        (
+            "- Parameters, size and MACs do not depend on the seed "
+            f"(taken from seed {cost['static_seed']})"
+        ),
+        f"- Trainable parameters: {static['trainable_params']}",
+        f"- Buffer values: {static['buffer_values']}",
+        f"- Serialized size: {static['model_size_bytes']} bytes",
+        f"- Analytical MACs/image: {static['macs_per_image']}",
+        f"- Hook MACs/image: {static['hook_macs_per_image']}",
+        "",
+        "### E8: batch-size sweep",
+        "",
+        "| Batch size | Latency p50 (ms) | Latency/image (µs) | Throughput (images/s) |",
+        "|---:|---:|---:|---:|",
+    ]
+
+    for batch_size, entry in cost["e8"].items():
+        lines.append(
+            f"| {batch_size} "
+            f"| {_ms(entry['latency_ms_p50'])} "
+            f"| {_ms(entry['latency_per_image_us'])} "
+            f"| {_ms(entry['throughput_img_s'])} |"
+        )
+
+    bridge = cost["bridge"]
+
+    if bridge is not None:
+        lines += [
+            "",
+            "### Isolated Hopfield bridge footprint",
+            "",
+            f"- Prototype shape: `{bridge['prototype_shape']}`",
+            f"- Prototype dtype: `{bridge['prototype_dtype']}`",
+            f"- Prototype storage: {bridge['prototype_storage_bytes']} bytes",
+            f"- Serialized bridge state: {bridge['model_size_bytes']} bytes",
+            f"- Bridge MACs per image: {bridge['macs_per_image']}",
+            f"- Retrieval beta: `{bridge['beta']:g}`",
+            f"- Retrieval updates: {bridge['num_updates']}",
+            f"- Centered: {bridge['centered']}",
+        ]
+
+    lines += [
+        "",
+        "## Notes",
+        "",
+        "- This run evaluates only its own model; nothing is compared here.",
+        "- Compare variants with `compare_memory_methods.py`.",
+        "- Per-example predictions are in the NPZ file for later paired tests.",
+        "- Fingerprints of the CNN weights and test labels are saved per seed so the comparison can verify a shared CNN.",
+        "- Memories are selected per class and stored in raw embedding space.",
+        "- The L2 variant changes only the selection objective, not the stored representation.",
         "- The L2 variant is an iCaRL-style normalized-feature Herding procedure, not a complete reproduction of iCaRL.",
-        "",
-        "## Saved prediction artifacts",
-        "",
-        "- `herding_predictions.npz` contains per-example labels, predictions, and correctness arrays.",
-        "- Artifact keys identify the noise condition, seed, noise level, model, and prediction type.",
-        "- These arrays permit later paired analysis without rerunning the experiment.",
+        "- Model size is the serialized state_dict size.",
+        "- CPU peak-memory estimates are not measurements of total process RAM.",
         "",
     ]
 
-    (output_dir / "herding_comparison.md").write_text(
+    (output_dir / MD_NAME).write_text(
         "\n".join(lines),
         encoding="utf-8",
     )
@@ -1592,19 +1269,22 @@ def save_results(
 
 def main(argv: list[str] | None = None) -> None:
     parser = benchmark.build_arg_parser(
-        "Evaluate K-means, raw Herding, or L2-normalized Herding "
-        "memory selection in the MNIST Hopfield benchmark."
+        "Run ONE variant (baseline, K-means, raw Herding or L2-normalized "
+        "Herding) of the MNIST Hopfield benchmark and save its artifacts."
     )
+    parser.set_defaults(config=DEFAULT_CONFIG_PATH)
 
     parser.add_argument(
         "--selection",
         choices=SELECTION_MODES,
         default="raw",
         help=(
-            "Memory selection method: "
+            "Variant to run: "
+            "'baseline' evaluates the CNN alone; "
             "'raw' uses raw-embedding Herding; "
             "'l2' uses L2-normalized Herding; "
-            "'kmeans' uses K-means. "
+            "'kmeans' uses K-means; "
+            "'all' runs all 4 variants and compares them. "
             "Selected memories are stored in raw embedding space. "
             "Default: raw."
         ),
@@ -1615,27 +1295,45 @@ def main(argv: list[str] | None = None) -> None:
 
     selection = args.selection
 
+    if selection == "all":
+        variants = ["baseline", "kmeans", "raw", "l2"]
+        for i, var in enumerate(variants):
+            print(
+                f"\n{'=' * 70}\nRunning variant '{var}' from {args.config}"
+                f"{' (quick mode)' if cfg.get('quick') else ''}\n{'=' * 70}"
+            )
+            out = run_experiment(
+                cfg,
+                selection=var,
+                retrain=args.retrain and (i == 0),
+            )
+            out_dir = Path(cfg["reports_dir"]) / f"{OUTPUT_PREFIX}{var}"
+            save_results(out, out_dir)
+            print(f"Variant '{var}' completed and saved to: {out_dir}")
+
+        print(f"\n{'=' * 70}\nAll 4 variants completed. Comparing artifacts...\n{'=' * 70}")
+        from benchmarks import compare_methods
+
+        compare_methods.main(["--reports-dir", str(cfg["reports_dir"])])
+        return
+
     print(
-        f"Running memory-selection experiment from {args.config}"
+        f"Running variant '{selection}' from {args.config}"
         f"{' (quick mode)' if cfg.get('quick') else ''}"
     )
-    print(f"Selection variant: {selection}")
 
-    raw = run_experiment(
+    output = run_experiment(
         cfg,
         selection=selection,
         retrain=args.retrain,
     )
 
-    output_dir = (
-        Path(cfg["reports_dir"])
-        / f"herding_comparison_{selection}"
-    )
+    output_dir = Path(cfg["reports_dir"]) / f"{OUTPUT_PREFIX}{selection}"
 
-    save_results(raw, output_dir)
+    save_results(output, output_dir)
 
-    print(f"\nSelection variant: {selection}")
-    print(f"Reports saved to: {output_dir}")
+    print(f"\nVariant: {selection}")
+    print(f"Artifacts saved to: {output_dir}")
 
 
 if __name__ == "__main__":

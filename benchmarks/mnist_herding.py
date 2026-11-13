@@ -14,14 +14,31 @@ def herding(
     k: int,
     *,
     normalize_for_selection: bool = True,
-) -> torch.Tensor:
+    return_indices: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Select k distinct embeddings whose mean approximates the class mean.
 
-    If normalize_for_selection=True:
-        - L2-normalize embeddings before calculating the class mean.
-        - Perform Herding selection using normalized embeddings.
-        - Return the corresponding original raw embeddings.
+    Args:
+        x:
+            Original embeddings with shape [N, D].
+        k:
+            Number of exemplars to select.
+        normalize_for_selection:
+            If True, use L2-normalized embeddings for selection.
+            If False, use original embeddings for selection.
+        return_indices:
+            If True, return (selected_indices, selected_embeddings).
+            If False (default), return selected_embeddings.
+
+    Returns:
+        selected_embeddings:
+            Corresponding original raw embeddings of shape [k, D].
+            Or (selected_indices, selected_embeddings) if return_indices=True.
+
+    Note:
+        Normalization affects selection only.
+        The returned embeddings are always original raw embeddings.
     """
 
     if x.ndim != 2:
@@ -38,21 +55,20 @@ def herding(
     if not 1 <= k <= n:
         raise ValueError("k must satisfy 1 <= k <= N.")
 
-    # Choose the representation used during selection.
-    # The original x is preserved for memory storage.
+    # 1. Choose the representation used during selection.
     selection_x = (
         F.normalize(x, p=2, dim=1)
         if normalize_for_selection
         else x
     )
 
-    # Mean of all selection embeddings belonging to this class.
+    # 2. Calculate the class mean.
     class_mean = selection_x.mean(dim=0)
 
-    # Running sum of the selection embeddings selected so far.
+    # 3. Initialize the running sum of selected embeddings.
     selected_sum = torch.zeros_like(class_mean)
 
-    # Prevent selecting the same embedding more than once.
+    # Track which candidates are still available.
     available = torch.ones(
         n,
         dtype=torch.bool,
@@ -61,41 +77,49 @@ def herding(
 
     selected_indices = []
 
+    # 4. Iteratively select k exemplars.
     for step in range(1, k + 1):
 
+        # Get indices of candidates not yet selected.
         candidate_indices = available.nonzero(
             as_tuple=True
         )[0]
 
         candidates = selection_x[candidate_indices]
 
-        # Mean that would result from selecting each candidate.
+        # Calculate the hypothetical mean if each candidate
+        # were added to the previously selected embeddings.
         candidate_means = (
             selected_sum.unsqueeze(0) + candidates
         ) / step
 
-        # Squared distance between each candidate mean and class mean.
+        # Calculate squared distance from the class mean.
         squared_errors = (
             candidate_means - class_mean
         ).square().sum(dim=1)
 
-        # Select the candidate that minimizes the error.
+        # Select the candidate producing the smallest error.
         best_index = candidate_indices[
             squared_errors.argmin()
         ]
 
         selected_indices.append(best_index)
 
-        # Update the running sum using the selection representation.
+        # Update the running sum.
         selected_sum += selection_x[best_index]
 
-        # Mark the candidate unavailable.
+        # Prevent selecting this sample again.
         available[best_index] = False
 
-    selected_indices = torch.stack(selected_indices)
+    # 5. Convert selected indices into a tensor.
+    selected_indices_tensor = torch.stack(selected_indices) if selected_indices else torch.empty(0, dtype=torch.long, device=x.device)
 
-    # Return original raw embeddings, not normalized embeddings.
-    return x[selected_indices]
+    # 6. Retrieve the original raw embeddings.
+    selected_embeddings = x[selected_indices_tensor]
+
+    if return_indices:
+        return selected_indices_tensor, selected_embeddings
+    return selected_embeddings
 
 
 def build_herding_memory(
@@ -135,7 +159,7 @@ def build_herding_memory(
 
     for class_id in range(num_classes):
 
-        # Extract raw embeddings belonging to this class.
+        # Extract original embeddings belonging to this class.
         class_embeddings = z_train[labels == class_id]
 
         if class_embeddings.shape[0] < per_class:
@@ -145,27 +169,26 @@ def build_herding_memory(
                 f"but {per_class} are required."
             )
 
-        # Select using the requested representation.
-        # Returned embeddings remain in their original raw form.
-        selected = herding(
+        # Select exemplars and retrieve their original embeddings.
+        selected_embeddings = herding(
             class_embeddings,
             per_class,
             normalize_for_selection=normalize_for_selection,
         )
 
-        memory_blocks.append(selected)
+        memory_blocks.append(selected_embeddings)
 
-        # Assign the corresponding class label to each selected embedding.
+        # Assign the corresponding class label to each exemplar.
         label_blocks.append(
             torch.full(
-                (selected.shape[0],),
+                (selected_embeddings.shape[0],),
                 class_id,
                 dtype=torch.long,
-                device=selected.device,
+                device=selected_embeddings.device,
             )
         )
 
-    # Combine the selected raw embeddings from all classes.
+    # Combine selected raw embeddings from all classes.
     memory = torch.cat(memory_blocks, dim=0)
 
     # Combine their corresponding labels.

@@ -50,9 +50,9 @@ placements: ["pixel", "embedding"]
 cost:
   batch_size: 256
   batch_sizes: [1, 32, 256, 1024]
-  warmup: 10
-  iters: 100
-  repeats: 5
+  warmup: 3
+  iters: 20
+  repeats: 3
   num_threads: 4
 
 # Quick mode.
